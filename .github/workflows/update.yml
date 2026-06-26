@@ -1,0 +1,136 @@
+name: Upload gtfs output
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  upload-release-assets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check remote MD5 against existing release MD5
+        id: check_md5
+        run: |
+          # Download source MD5
+          SRC_MD5_URL="https://github.com/catenarytransit/pfaedled-gtfs-actions/releases/download/latest/fahrplaene_gesamtdeutschland_gtfs_raw.zip.md5"
+          if wget --spider --quiet "$SRC_MD5_URL"; then
+            wget --quiet -O source_md5.txt "$SRC_MD5_URL"
+            NEW_MD5=$(cat source_md5.txt | tr -d '[:space:]')
+          else
+            NEW_MD5=""
+          fi
+
+          # Download our existing MD5
+          OUR_MD5_URL="https://github.com/${{ github.repository }}/releases/download/latest/fahrplaene_gesamtdeutschland_gtfs_raw.zip.md5"
+          if wget --spider --quiet "$OUR_MD5_URL"; then
+            wget --quiet -O existing_md5.txt "$OUR_MD5_URL"
+            EXISTING_MD5=$(cat existing_md5.txt | tr -d '[:space:]')
+          else
+            EXISTING_MD5=""
+          fi
+
+          echo "Remote Source MD5: '$NEW_MD5'"
+          echo "Our Existing MD5:   '$EXISTING_MD5'"
+
+          if [ -n "$NEW_MD5" ] && [ "$NEW_MD5" = "$EXISTING_MD5" ]; then
+            echo "MD5 matches. No updates to process. Skipping remaining steps."
+            echo "should_skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "MD5 differs or could not be determined. Proceeding with split."
+            echo "should_skip=false" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Download GTFS Raw
+        if: steps.check_md5.outputs.should_skip != 'true'
+        run: |
+          wget -q https://github.com/catenarytransit/pfaedled-gtfs-actions/releases/download/latest/fahrplaene_gesamtdeutschland_gtfs_raw.zip
+        shell: bash
+
+      - name: Calculate and verify local MD5 hash
+        id: calculate_md5
+        if: steps.check_md5.outputs.should_skip != 'true'
+        run: |
+          filepath="fahrplaene_gesamtdeutschland_gtfs_raw.zip"
+          md5_hash=$(md5sum "$filepath" | awk '{print $1}')
+          echo "MD5_HASH=$md5_hash" >> $GITHUB_OUTPUT
+          echo "$md5_hash" > "$filepath.md5"
+          echo "Downloaded file MD5: $md5_hash"
+        shell: bash
+
+      - name: Double check MD5 against existing release MD5
+        id: double_check_md5
+        if: steps.check_md5.outputs.should_skip != 'true'
+        run: |
+          NEW_MD5="${{ steps.calculate_md5.outputs.MD5_HASH }}"
+          
+          OUR_MD5_URL="https://github.com/${{ github.repository }}/releases/download/latest/fahrplaene_gesamtdeutschland_gtfs_raw.zip.md5"
+          if wget --spider --quiet "$OUR_MD5_URL"; then
+            wget --quiet -O existing_md5.txt "$OUR_MD5_URL"
+            EXISTING_MD5=$(cat existing_md5.txt | tr -d '[:space:]')
+          else
+            EXISTING_MD5=""
+          fi
+
+          echo "Calculated MD5:     '$NEW_MD5'"
+          echo "Our Existing MD5:   '$EXISTING_MD5'"
+
+          if [ "$NEW_MD5" = "$EXISTING_MD5" ]; then
+            echo "MD5 matches. Skipping processing."
+            echo "should_skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "MD5 does not match. Processing GTFS."
+            echo "should_skip=false" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Set up Rust
+        if: steps.check_md5.outputs.should_skip != 'true' && steps.double_check_md5.outputs.should_skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Unzip GTFS Raw
+        if: steps.check_md5.outputs.should_skip != 'true' && steps.double_check_md5.outputs.should_skip != 'true'
+        run: |
+          unzip -q fahrplaene_gesamtdeutschland_gtfs_raw.zip -d gtfs_raw
+        shell: bash
+
+      - name: Run GTFS Splitter
+        if: steps.check_md5.outputs.should_skip != 'true' && steps.double_check_md5.outputs.should_skip != 'true'
+        run: |
+          cargo run --release
+        shell: bash
+
+      - name: Zip output subfolders individually
+        if: steps.check_md5.outputs.should_skip != 'true' && steps.double_check_md5.outputs.should_skip != 'true'
+        run: |
+          mkdir -p zips
+          cd gtfs_output
+          for dir in */; do
+            folder_name="${dir%/}"
+            echo "Zipping $folder_name..."
+            cd "$folder_name"
+            zip -q -r "../../zips/$folder_name.zip" .
+            cd ..
+          done
+          cd ..
+        shell: bash
+
+      - name: Upload assets to GitHub Release
+        if: steps.check_md5.outputs.should_skip != 'true' && steps.double_check_md5.outputs.should_skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Ensure the release tagged 'latest' exists
+          gh release create latest --title "Latest GTFS Splits" --notes "Automatically updated GTFS splits." --prerelease || echo "Release already exists"
+          
+          # Upload all individual zips and our new md5 file
+          gh release upload latest zips/*.zip fahrplaene_gesamtdeutschland_gtfs_raw.zip.md5 --clobber
+        shell: bash
