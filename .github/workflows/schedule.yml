@@ -1,0 +1,14 @@
+name: Update Scheduled
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+    
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  call-update:
+    uses: ./.github/workflows/update.yml
