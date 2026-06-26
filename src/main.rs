@@ -1,9 +1,9 @@
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 struct GeoJson {
@@ -76,10 +76,18 @@ fn calculate_bbox(coords: &[Vec<Vec<Vec<f64>>>]) -> (f64, f64, f64, f64) {
                 if pt.len() >= 2 {
                     let lon = pt[0];
                     let lat = pt[1];
-                    if lon < min_lon { min_lon = lon; }
-                    if lon > max_lon { max_lon = lon; }
-                    if lat < min_lat { min_lat = lat; }
-                    if lat > max_lat { max_lat = lat; }
+                    if lon < min_lon {
+                        min_lon = lon;
+                    }
+                    if lon > max_lon {
+                        max_lon = lon;
+                    }
+                    if lat < min_lat {
+                        min_lat = lat;
+                    }
+                    if lat > max_lat {
+                        max_lat = lat;
+                    }
                 }
             }
         }
@@ -105,9 +113,7 @@ fn point_in_ring(x: f64, y: f64, ring: &[Vec<f64>]) -> bool {
         let xj = ring[j][0];
         let yj = ring[j][1];
 
-        if ((yi > y) != (yj > y))
-            && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)
-        {
+        if ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
             inside = !inside;
         }
         j = i;
@@ -221,14 +227,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for result in stops_reader.deserialize::<StopRow>() {
         let row = result?;
         let stop_id: Arc<str> = Arc::from(row.stop_id);
-        let parent_station: Option<Arc<str>> = row.parent_station
+        let parent_station: Option<Arc<str>> = row
+            .parent_station
             .filter(|s| !s.trim().is_empty())
             .map(|s| Arc::from(s.trim()));
 
-        let lat: Option<f64> = row.stop_lat.as_ref()
+        let lat: Option<f64> = row
+            .stop_lat
+            .as_ref()
             .filter(|s| !s.trim().is_empty())
             .and_then(|s| s.trim().parse::<f64>().ok());
-        let lon: Option<f64> = row.stop_lon.as_ref()
+        let lon: Option<f64> = row
+            .stop_lon
+            .as_ref()
             .filter(|s| !s.trim().is_empty())
             .and_then(|s| s.trim().parse::<f64>().ok());
 
@@ -263,10 +274,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for result in agency_reader.deserialize::<AgencyRow>() {
         let row = result?;
         let is_db = row.agency_name.starts_with("DB ");
-        agency_map.insert(row.agency_id.clone(), AgencyInfo {
-            name: row.agency_name,
-            is_db,
-        });
+        agency_map.insert(
+            row.agency_id.clone(),
+            AgencyInfo {
+                name: row.agency_name,
+                is_db,
+            },
+        );
     }
     println!("Loaded {} agencies.", agency_map.len());
 
@@ -318,18 +332,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .has_headers(true)
         .from_path(stop_times_path)?;
 
-    let mut agency_states: HashMap<u16, HashSet<Option<String>>> = HashMap::new();
+    // Count stop times per (agency, state) so we can compute the dominant-state fraction.
+    let mut agency_state_counts: HashMap<u16, HashMap<Option<String>, u32>> = HashMap::new();
 
     let mut count = 0;
     for result in stop_times_reader.deserialize::<StopTimeRow>() {
         let row = result?;
         if let Some(&agency_idx) = trip_agency_map.get(row.trip_id.as_str()) {
-            let stop_state = stop_map.get(row.stop_id.as_str())
+            let stop_state = stop_map
+                .get(row.stop_id.as_str())
                 .map(|(state, _)| state.clone())
                 .flatten();
-            agency_states.entry(agency_idx)
-                .or_insert_with(HashSet::new)
-                .insert(stop_state);
+            *agency_state_counts
+                .entry(agency_idx)
+                .or_default()
+                .entry(stop_state)
+                .or_insert(0) += 1;
         }
         count += 1;
         if count % 10_000_000 == 0 {
@@ -340,21 +358,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut agency_target_folders: HashMap<u16, String> = HashMap::new();
 
-    for (&agency_idx, states) in &agency_states {
+    for (&agency_idx, state_counts) in &agency_state_counts {
         let agency_id = &agencies_list[agency_idx as usize];
         let agency_info = &agency_map[agency_id];
-        
+
         let target = if agency_info.is_db {
             "deutsche_bahn".to_string()
         } else {
-            if states.len() == 1 {
-                if let Some(Some(state_name)) = states.iter().next() {
+            let total: u32 = state_counts.values().sum();
+            let dominant = state_counts.iter().max_by_key(|&(_, &c)| c);
+            match dominant {
+                Some((Some(state_name), &dom_count))
+                    if total > 0 && dom_count as f64 / total as f64 >= 0.90 =>
+                {
                     state_name.clone()
-                } else {
-                    "other".to_string()
                 }
-            } else {
-                "other".to_string()
+                _ => "other".to_string(),
             }
         };
         agency_target_folders.insert(agency_idx, target);
@@ -371,6 +390,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "other".to_string()
             }
         });
+    }
+
+    // Forced folder overrides for agencies that are misclassified by the
+    // geographic heuristic (e.g. they operate across state lines or have
+    // stops outside their home region).
+    let forced_folders: &[(&str, &str)] = &[
+        ("Berliner Verkehrsbetriebe", "berlin"),
+        ("Leipziger Verkehrsbetriebe", "sachsen"),
+        ("MVV-Regionalbus", "bayern"),
+        ("SEV Tram München", "bayern"),
+        ("Hochbahn Bus", "hamburg"),
+        ("Hochbahn U-Bahn", "hamburg"),
+        ("Mecklenburg Vorpommersche VG", "mecklenburg_vorpommern"),
+    ];
+
+    for idx in 0..agencies_list.len() {
+        let agency_idx = idx as u16;
+        let agency_id = &agencies_list[idx];
+        let agency_name = &agency_map[agency_id].name;
+        if let Some(&(_, folder)) = forced_folders.iter().find(|(name, _)| name == agency_name) {
+            agency_target_folders.insert(agency_idx, folder.to_string());
+        }
     }
 
     let mut folder_counts: HashMap<String, usize> = HashMap::new();
@@ -481,10 +522,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let trip_id: Arc<str> = Arc::from(row.trip_id);
                         trip_folder_map.insert(trip_id, folder.clone());
-                        services_needed.get_mut(folder).unwrap().insert(Arc::from(row.service_id));
+                        services_needed
+                            .get_mut(folder)
+                            .unwrap()
+                            .insert(Arc::from(row.service_id));
                         if let Some(shape_id) = row.shape_id {
                             if !shape_id.trim().is_empty() {
-                                shapes_needed.get_mut(folder).unwrap().insert(Arc::from(shape_id.trim()));
+                                shapes_needed
+                                    .get_mut(folder)
+                                    .unwrap()
+                                    .insert(Arc::from(shape_id.trim()));
                             }
                         }
                     }
@@ -521,7 +568,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(writer) = writers.get_mut(folder) {
                     writer.write_record(&record)?;
                 }
-                stops_needed.get_mut(folder).unwrap().insert(Arc::from(row.stop_id));
+                stops_needed
+                    .get_mut(folder)
+                    .unwrap()
+                    .insert(Arc::from(row.stop_id));
             }
             count += 1;
             if count % 10_000_000 == 0 {
@@ -550,7 +600,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for parent_id in to_add {
             stops.insert(parent_id);
         }
-        println!("  {}: needs {} stops (including parents)", folder, stops.len());
+        println!(
+            "  {}: needs {} stops (including parents)",
+            folder,
+            stops.len()
+        );
     }
 
     println!("Writing stops.txt splits...");
@@ -584,7 +638,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if let Some(level_id) = &row.level_id {
                         if !level_id.trim().is_empty() {
-                            levels_needed.get_mut(folder).unwrap().insert(Arc::from(level_id.trim()));
+                            levels_needed
+                                .get_mut(folder)
+                                .unwrap()
+                                .insert(Arc::from(level_id.trim()));
                         }
                     }
                 }
@@ -706,7 +763,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let from_stop: Arc<str> = Arc::from(row.from_stop_id.as_str());
             let to_stop: Arc<str> = Arc::from(row.to_stop_id.as_str());
             for folder in &active_folders {
-                if stops_needed[folder].contains(&from_stop) && stops_needed[folder].contains(&to_stop) {
+                if stops_needed[folder].contains(&from_stop)
+                    && stops_needed[folder].contains(&to_stop)
+                {
                     if let Some(writer) = writers.get_mut(folder) {
                         writer.write_record(&record)?;
                     }
@@ -742,7 +801,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let from_stop: Arc<str> = Arc::from(row.from_stop_id.as_str());
             let to_stop: Arc<str> = Arc::from(row.to_stop_id.as_str());
             for folder in &active_folders {
-                if stops_needed[folder].contains(&from_stop) && stops_needed[folder].contains(&to_stop) {
+                if stops_needed[folder].contains(&from_stop)
+                    && stops_needed[folder].contains(&to_stop)
+                {
                     if let Some(writer) = writers.get_mut(folder) {
                         writer.write_record(&record)?;
                     }
